@@ -12,7 +12,10 @@ use ostd::{
 use self::status::{AtomicThreadStatus, ThreadStatus};
 use crate::{
     prelude::*,
-    sched::priority::{AtomicPriority, Priority},
+    sched::{
+        priority::{AtomicPriority, Priority},
+        SchedAttr,
+    },
 };
 
 pub mod exception;
@@ -39,6 +42,7 @@ pub struct Thread {
     priority: AtomicPriority,
     /// Thread CPU affinity
     cpu_affinity: AtomicCpuSet,
+    sched_entity: SpinLock<SchedAttr>,
 }
 
 impl Thread {
@@ -46,16 +50,16 @@ impl Thread {
     pub fn new(
         task: Weak<Task>,
         data: impl Send + Sync + Any,
-        status: ThreadStatus,
         priority: Priority,
         cpu_affinity: CpuSet,
     ) -> Self {
         Thread {
             task,
             data: Box::new(data),
-            status: AtomicThreadStatus::new(status),
+            status: AtomicThreadStatus::new(ThreadStatus::Init),
             priority: AtomicPriority::new(priority),
             cpu_affinity: AtomicCpuSet::new(cpu_affinity),
+            sched_entity: SpinLock::new(SchedAttr::new(priority)),
         }
     }
 
@@ -146,9 +150,23 @@ impl Thread {
         &self.priority
     }
 
+    /// Returns the current priority.
+    pub fn priority(&self) -> Priority {
+        self.priority.load(Ordering::Relaxed)
+    }
+
+    /// Updates the priority with the new value.
+    pub fn set_priority(&self, new_priority: Priority) {
+        self.priority.store(new_priority, Ordering::Relaxed)
+    }
+
     /// Returns the reference to the atomic CPU affinity.
     pub fn atomic_cpu_affinity(&self) -> &AtomicCpuSet {
         &self.cpu_affinity
+    }
+
+    pub fn sched_attr(&self) -> &SpinLock<SchedAttr> {
+        &self.sched_entity
     }
 
     pub fn yield_now() {

@@ -7,6 +7,7 @@ use core::{
     cell::UnsafeCell,
     fmt,
     marker::PhantomData,
+    mem::{self, ManuallyDrop},
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -113,8 +114,9 @@ impl<T: ?Sized, G: Guardian> SpinLock<T, G> {
         let inner_guard = G::guard();
         self.acquire_lock();
         SpinLockGuard_ {
-            lock: self,
-            guard: inner_guard,
+            lock: ManuallyDrop::new(self),
+            val: self.inner.val.get(),
+            guard: ManuallyDrop::new(inner_guard),
         }
     }
 
@@ -128,8 +130,9 @@ impl<T: ?Sized, G: Guardian> SpinLock<T, G> {
         let inner_guard = G::guard();
         self.acquire_lock();
         SpinLockGuard_ {
-            lock: self.clone(),
-            guard: inner_guard,
+            lock: ManuallyDrop::new(self.clone()),
+            val: self.inner.val.get(),
+            guard: ManuallyDrop::new(inner_guard),
         }
     }
 
@@ -138,8 +141,9 @@ impl<T: ?Sized, G: Guardian> SpinLock<T, G> {
         let inner_guard = G::guard();
         if self.try_acquire_lock() {
             let lock_guard = SpinLockGuard_ {
-                lock: self,
-                guard: inner_guard,
+                lock: ManuallyDrop::new(self),
+                val: self.inner.val.get(),
+                guard: ManuallyDrop::new(inner_guard),
             };
             return Some(lock_guard);
         }
@@ -176,53 +180,124 @@ unsafe impl<T: ?Sized + Send, G> Send for SpinLock<T, G> {}
 unsafe impl<T: ?Sized + Send, G> Sync for SpinLock<T, G> {}
 
 /// A guard that provides exclusive access to the data protected by a [`SpinLock`].
-pub type SpinLockGuard<'a, T, G> = SpinLockGuard_<T, &'a SpinLock<T, G>, G>;
+pub type SpinLockGuard<'a, T, G, U = T> = SpinLockGuard_<T, &'a SpinLock<T, G>, G, U>;
 /// A guard that provides exclusive access to the data protected by a `Arc<SpinLock>`.
-pub type ArcSpinLockGuard<T, G> = SpinLockGuard_<T, Arc<SpinLock<T, G>>, G>;
+pub type ArcSpinLockGuard<T, G, U = T> = SpinLockGuard_<T, Arc<SpinLock<T, G>>, G, U>;
 
 /// The guard of a spin lock.
 #[clippy::has_significant_drop]
 #[must_use]
-pub struct SpinLockGuard_<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian> {
-    guard: G::Guard,
-    lock: R,
+pub struct SpinLockGuard_<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: ?Sized = T>
+{
+    guard: ManuallyDrop<G::Guard>,
+    val: *mut U,
+    lock: ManuallyDrop<R>,
 }
 
-impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian> Deref for SpinLockGuard_<T, R, G> {
-    type Target = T;
+impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: ?Sized>
+    SpinLockGuard_<T, R, G, U>
+{
+    /// Makes a new `SpinLockGuard` for a component of the locked data.
+    ///
+    /// This operation cannot fail as the `SpinLockGuard` passed in already
+    /// locked the spin lock.
+    ///
+    /// This is an associated function that needs to be
+    /// used as `SpinLockGuard_::map(...)`. A method would interfere with methods of
+    /// the same name on the contents of the locked data.
+    pub fn map<U2: ?Sized>(
+        mut this: Self,
+        f: impl FnOnce(&mut U) -> &mut U2,
+    ) -> SpinLockGuard_<T, R, G, U2> {
+        let lock = unsafe { ManuallyDrop::take(&mut this.lock) };
+        let guard = unsafe { ManuallyDrop::take(&mut this.guard) };
+        let val = this.val;
+        mem::forget(this);
 
-    fn deref(&self) -> &T {
-        unsafe { &*self.lock.inner.val.get() }
+        let mapped = f(unsafe { &mut *val });
+
+        SpinLockGuard_ {
+            lock: ManuallyDrop::new(lock),
+            val: mapped,
+            guard: ManuallyDrop::new(guard),
+        }
+    }
+
+    /// Attempts to make a new `SpinLockGuard` for a component of the
+    /// locked data. The original guard is returned if the closure returns `None`.
+    ///
+    /// This operation cannot fail as the `SpinLockGuard` passed in already locked the spin lock.
+    ///
+    /// This is an associated function that needs to be used as `SpinLockGuard_::try_map(...)`.
+    /// A method would interfere with methods of the same name on the contents of the locked data.
+    pub fn try_map<U2: ?Sized>(
+        mut this: Self,
+        f: impl FnOnce(&mut U) -> Option<&mut U2>,
+    ) -> Result<SpinLockGuard_<T, R, G, U2>, Self> {
+        let lock = unsafe { ManuallyDrop::take(&mut this.lock) };
+        let guard = unsafe { ManuallyDrop::take(&mut this.guard) };
+        let val = this.val;
+        mem::forget(this);
+
+        match f(unsafe { &mut *val }) {
+            Some(mapped) => Ok(SpinLockGuard_ {
+                lock: ManuallyDrop::new(lock),
+                val: mapped,
+                guard: ManuallyDrop::new(guard),
+            }),
+            None => Err(SpinLockGuard_ {
+                lock: ManuallyDrop::new(lock),
+                val,
+                guard: ManuallyDrop::new(guard),
+            }),
+        }
     }
 }
 
-impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian> DerefMut
-    for SpinLockGuard_<T, R, G>
+impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: ?Sized> Deref
+    for SpinLockGuard_<T, R, G, U>
+{
+    type Target = U;
+
+    fn deref(&self) -> &U {
+        unsafe { &*self.val }
+    }
+}
+
+impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: ?Sized> DerefMut
+    for SpinLockGuard_<T, R, G, U>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.lock.inner.val.get() }
+        unsafe { &mut *self.val }
     }
 }
 
-impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian> Drop for SpinLockGuard_<T, R, G> {
+impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: ?Sized> Drop
+    for SpinLockGuard_<T, R, G, U>
+{
     fn drop(&mut self) {
         self.lock.release_lock();
+        unsafe { ManuallyDrop::drop(&mut self.lock) };
+        unsafe { ManuallyDrop::drop(&mut self.guard) };
     }
 }
 
-impl<T: ?Sized + fmt::Debug, R: Deref<Target = SpinLock<T, G>>, G: Guardian> fmt::Debug
-    for SpinLockGuard_<T, R, G>
+impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: fmt::Debug + ?Sized> fmt::Debug
+    for SpinLockGuard_<T, R, G, U>
 {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian> !Send for SpinLockGuard_<T, R, G> {}
+impl<T: ?Sized, R: Deref<Target = SpinLock<T, G>>, G: Guardian, U: ?Sized> !Send
+    for SpinLockGuard_<T, R, G, U>
+{
+}
 
 // SAFETY: `SpinLockGuard_` can be shared between tasks/threads in same CPU.
 // As `lock()` is only called when there are no race conditions caused by interrupts.
-unsafe impl<T: ?Sized + Sync, R: Deref<Target = SpinLock<T, G>> + Sync, G: Guardian> Sync
-    for SpinLockGuard_<T, R, G>
+unsafe impl<T: ?Sized + Sync, R: Deref<Target = SpinLock<T, G>> + Sync, G: Guardian, U: ?Sized + Sync>
+    Sync for SpinLockGuard_<T, R, G, U>
 {
 }

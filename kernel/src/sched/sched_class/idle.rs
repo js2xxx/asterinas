@@ -2,9 +2,6 @@
 
 use super::*;
 
-#[derive(Debug)]
-pub struct IdleAttr(pub(super) ());
-
 /// The per-cpu run queue for the IDLE scheduling class.
 ///
 /// This run queue is used for the per-cpu idle thread, if any.
@@ -30,9 +27,7 @@ impl core::fmt::Debug for IdleClassRq {
 }
 
 impl SchedClassRq for IdleClassRq {
-    type Attr = IdleAttr;
-
-    fn enqueue(&mut self, thread: Arc<Thread>, _: SpinLockGuard<'_, SchedAttr, PreemptDisabled>) {
+    fn enqueue(&mut self, thread: Arc<Thread>) {
         let ptr = Arc::as_ptr(&thread);
         if let Some(t) = self.thread.replace(thread)
             && ptr != Arc::as_ptr(&t)
@@ -49,7 +44,7 @@ impl SchedClassRq for IdleClassRq {
         self.thread.clone()
     }
 
-    fn update_current(&mut self, _: &mut IdleAttr, _flags: UpdateFlags) -> bool {
+    fn update_current(&mut self, _: u64, _: &Thread, _flags: UpdateFlags) -> bool {
         // Idle threads has the greatest priority value. They should always be preempted.
         true
     }

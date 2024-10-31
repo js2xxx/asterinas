@@ -42,7 +42,7 @@ pub struct Thread {
     priority: AtomicPriority,
     /// Thread CPU affinity
     cpu_affinity: AtomicCpuSet,
-    sched_entity: SpinLock<SchedAttr>,
+    sched_attr: SchedAttr,
 }
 
 impl Thread {
@@ -59,7 +59,7 @@ impl Thread {
             status: AtomicThreadStatus::new(ThreadStatus::Init),
             priority: AtomicPriority::new(priority),
             cpu_affinity: AtomicCpuSet::new(cpu_affinity),
-            sched_entity: SpinLock::new(SchedAttr::new(priority)),
+            sched_attr: SchedAttr::new(priority.into()),
         }
     }
 
@@ -150,23 +150,13 @@ impl Thread {
         &self.priority
     }
 
-    /// Returns the current priority.
-    pub fn priority(&self) -> Priority {
-        self.priority.load(Ordering::Relaxed)
-    }
-
-    /// Updates the priority with the new value.
-    pub fn set_priority(&self, new_priority: Priority) {
-        self.priority.store(new_priority, Ordering::Relaxed)
-    }
-
     /// Returns the reference to the atomic CPU affinity.
     pub fn atomic_cpu_affinity(&self) -> &AtomicCpuSet {
         &self.cpu_affinity
     }
 
-    pub fn sched_attr(&self) -> &SpinLock<SchedAttr> {
-        &self.sched_entity
+    pub fn sched_attr(&self) -> &SchedAttr {
+        &self.sched_attr
     }
 
     pub fn yield_now() {

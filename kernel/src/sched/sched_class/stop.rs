@@ -2,9 +2,6 @@
 
 use super::*;
 
-#[derive(Debug)]
-pub struct StopAttr(pub(super) ());
-
 /// The per-cpu run queue for the STOP scheduling class.
 ///
 /// This is a singleton class, meaning that only one thread can be in this class at a time.
@@ -33,9 +30,7 @@ impl core::fmt::Debug for StopClassRq {
 }
 
 impl SchedClassRq for Arc<StopClassRq> {
-    type Attr = StopAttr;
-
-    fn enqueue(&mut self, thread: Arc<Thread>, _: SpinLockGuard<'_, SchedAttr, PreemptDisabled>) {
+    fn enqueue(&mut self, thread: Arc<Thread>) {
         if self.thread.lock().replace(thread).is_some() {
             panic!("Multiple `stop` threads spawned")
         }
@@ -49,7 +44,7 @@ impl SchedClassRq for Arc<StopClassRq> {
         self.thread.lock().take()
     }
 
-    fn update_current(&mut self, _: &mut StopAttr, _flags: UpdateFlags) -> bool {
+    fn update_current(&mut self, _: u64, _: &Thread, _flags: UpdateFlags) -> bool {
         // Stop threads has the lowest priority value. They should never be preempted.
         false
     }

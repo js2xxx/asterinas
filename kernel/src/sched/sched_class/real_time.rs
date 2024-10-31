@@ -1,12 +1,45 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::collections::vec_deque::VecDeque;
-use core::{array, num::NonZero};
+use core::{
+    array,
+    num::NonZero,
+    sync::atomic::{AtomicU8, Ordering::*},
+};
 
 use bitvec::{bitarr, BitArr};
 
 use super::{time::base_slice_clocks, *};
-use crate::sched::priority::Priority;
+
+pub type RtPrio = RangedU8<1, 99>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealTimePolicy {
+    Fifo,
+    RoundRobin {
+        base_slice_factor: Option<NonZero<u64>>,
+    },
+}
+
+impl Default for RealTimePolicy {
+    fn default() -> Self {
+        Self::RoundRobin {
+            base_slice_factor: None,
+        }
+    }
+}
+
+impl RealTimePolicy {
+    fn to_time_slice(self) -> u64 {
+        match self {
+            RealTimePolicy::RoundRobin { base_slice_factor } => {
+                base_slice_clocks()
+                    * base_slice_factor.map_or(DEFAULT_BASE_SLICE_FACTOR, NonZero::get)
+            }
+            RealTimePolicy::Fifo => 0,
+        }
+    }
+}
 
 /// The scheduling attribute for the REAL-TIME scheduling class.
 ///
@@ -19,26 +52,25 @@ use crate::sched::priority::Priority;
 /// - If the time slice is set, the thread is considered to be an RR
 ///   (round-robin) thread, and will be executed for the time slice, and
 ///   then it will be put back to the inactive array.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub struct RealTimeAttr {
-    priority: Priority,
-    time_slice: Option<NonZero<u64>>, // SCHED_RR; SCHED_FIFO
-
-    start: u64,
+    prio: AtomicU8,
+    time_slice: AtomicU64, // 0 for SCHED_FIFO; other for SCHED_RR
 }
 
+const DEFAULT_BASE_SLICE_FACTOR: u64 = 20;
+
 impl RealTimeAttr {
-    pub fn new(priority: Priority) -> Self {
-        let n = base_slice_clocks() * 20; // 0.75ms * 20 = 15ms
+    pub fn new(prio: u8, policy: RealTimePolicy) -> Self {
         RealTimeAttr {
-            priority,
-            // Defaults to be an RR thread.
-            //
-            // TODO: Add some scheduling strategy configuration to
-            // be able to set the attr to be a FIFO thread.
-            time_slice: NonZero::new(n),
-            start: sched_clock(),
+            prio: prio.into(),
+            time_slice: AtomicU64::new(policy.to_time_slice()),
         }
+    }
+
+    pub fn update(&self, prio: u8, policy: RealTimePolicy) {
+        self.prio.store(prio, Relaxed);
+        self.time_slice.store(policy.to_time_slice(), Relaxed);
     }
 }
 
@@ -49,16 +81,16 @@ struct PrioArray {
 
 impl core::fmt::Debug for PrioArray {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "map: ")?;
-        f.debug_list().entries(self.map.iter_ones()).finish()?;
-        for thread in self.queue.iter().flatten() {
-            let attr = match *thread.sched_attr().lock() {
-                SchedAttr::RealTime(real_time_attr) => real_time_attr,
-                _ => unreachable!(),
-            };
-            writeln!(f, "    {attr:?}")?;
-        }
-        Ok(())
+        f.debug_struct("PrioArray")
+            .field_with("map", |f| {
+                f.debug_list().entries(self.map.iter_ones()).finish()
+            })
+            .field_with("queue", |f| {
+                f.debug_list()
+                    .entries((self.queue.iter().flatten()).map(|thread| &thread.sched_attr().fair))
+                    .finish()
+            })
+            .finish()
     }
 }
 
@@ -72,7 +104,7 @@ impl PrioArray {
         }
     }
 
-    fn pop(&mut self, target_cpu: CpuId) -> Option<Arc<Thread>> {
+    fn pop(&mut self, target_cpu: Option<CpuId>) -> Option<Arc<Thread>> {
         let mut iter = self.map.iter_ones();
         let (thread, prio, queue) = 'find: loop {
             let prio = iter.next()? as u8;
@@ -80,7 +112,7 @@ impl PrioArray {
             let queue = &mut self.queue[usize::from(prio)];
             for _ in 0..queue.len() {
                 let thread = queue.pop_front()?;
-                if thread.atomic_cpu_affinity().load().contains(target_cpu) {
+                if target_cpu.is_none_or(|cpu| thread.atomic_cpu_affinity().load().contains(cpu)) {
                     break 'find (thread, prio, queue);
                 }
                 queue.push_back(thread);
@@ -106,6 +138,7 @@ impl PrioArray {
 /// is empty, the 2 arrays are swapped by `index`.
 #[derive(Debug)]
 pub(super) struct RealTimeClassRq {
+    #[allow(unused)]
     cpu: CpuId,
     index: bool,
     array: [PrioArray; 2],
@@ -137,18 +170,9 @@ impl RealTimeClassRq {
 }
 
 impl SchedClassRq for RealTimeClassRq {
-    type Attr = RealTimeAttr;
-
-    fn enqueue(
-        &mut self,
-        thread: Arc<Thread>,
-        attr: SpinLockGuard<'_, SchedAttr, PreemptDisabled>,
-    ) {
-        let prio = match &*attr {
-            SchedAttr::RealTime(attr) => attr.priority,
-            _ => unreachable!(),
-        };
-        self.inactive_array().enqueue(thread, prio.range().get());
+    fn enqueue(&mut self, thread: Arc<Thread>) {
+        let prio = thread.sched_attr().real_time.prio.load(Relaxed);
+        self.inactive_array().enqueue(thread, prio);
     }
 
     fn is_empty(&mut self) -> bool {
@@ -156,26 +180,24 @@ impl SchedClassRq for RealTimeClassRq {
     }
 
     fn pick_next(&mut self) -> Option<Arc<Thread>> {
-        let target_cpu = self.cpu;
-        self.active_array().pop(target_cpu).or_else(|| {
+        self.active_array().pop(None).or_else(|| {
             self.swap_arrays();
-            self.active_array().pop(target_cpu)
+            self.active_array().pop(None)
         })
     }
 
-    fn update_current(&mut self, rt: &mut RealTimeAttr, flags: UpdateFlags) -> bool {
-        let now = sched_clock();
-        let should_preempt = match flags {
-            UpdateFlags::Tick | UpdateFlags::Wait => match rt.time_slice {
-                Some(ts) => ts.get() <= now - rt.start,
-                None => (self.inactive_array().map.iter_ones().next())
-                    .is_some_and(|prio| prio > usize::from(rt.priority.range().get())),
+    fn update_current(&mut self, now: u64, thread: &Thread, flags: UpdateFlags) -> bool {
+        let attr = &thread.sched_attr();
+        let rt = &attr.real_time;
+
+        match flags {
+            UpdateFlags::Tick | UpdateFlags::Wait => match rt.time_slice.load(Relaxed) {
+                0 => (self.inactive_array().map.iter_ones().next()).is_some_and(|prio| {
+                    prio > usize::from(thread.sched_attr().real_time.prio.load(Relaxed))
+                }),
+                ts => ts <= now - attr.period_start.load(Relaxed),
             },
             UpdateFlags::Yield => true,
-        };
-        if should_preempt {
-            rt.start = now;
         }
-        should_preempt
     }
 }

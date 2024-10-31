@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{collections::btree_set::BTreeSet, sync::Arc};
-use core::{cmp, ops::Bound};
+use core::{
+    cmp,
+    ops::Bound,
+    sync::atomic::{AtomicU64, Ordering::*},
+};
 
 use ostd::{
     cpu::{num_cpus, CpuId},
-    sync::{PreemptDisabled, SpinLockGuard},
     task::scheduler::UpdateFlags,
 };
 
 use super::{
-    sched_clock,
     time::{base_slice_clocks, min_period_clocks},
-    SchedAttr, SchedClassRq,
+    SchedClassRq,
 };
 use crate::{sched::priority::Nice, thread::Thread};
 
@@ -70,66 +72,49 @@ pub const fn nice_to_weight(nice: Nice) -> u64 {
 ///
 /// When a thread's time slice is exhausted, it will be put back to the
 /// run queue.
-#[derive(Debug, Clone, Copy)]
+
+#[derive(Debug)]
 pub struct FairAttr {
-    weight: u64,
-    vruntime: u64,
-    start: u64,
-    period_start: u64,
+    weight: AtomicU64,
+    vruntime: AtomicU64,
 }
 
 impl FairAttr {
     pub fn new(nice: Nice) -> Self {
-        let now = sched_clock();
         FairAttr {
-            weight: nice_to_weight(nice),
-
-            vruntime: 0,
-            start: now,
-            period_start: now,
+            weight: nice_to_weight(nice).into(),
+            vruntime: Default::default(),
         }
     }
 
-    fn tick(&mut self, total_weight: u64, period: u64) -> bool {
+    pub fn update(&self, nice: Nice) {
+        self.weight.store(nice_to_weight(nice), Relaxed);
+    }
+
+    fn tick(
+        &self,
+        now: u64,
+        start: u64,
+        period_start: u64,
+        total_weight: u64,
+        period: u64,
+    ) -> bool {
+        let weight = self.weight.load(Relaxed);
+
         // Update the vruntime.
-        let cur = sched_clock();
-        self.vruntime += (cur - self.start) * WEIGHT_0 / self.weight;
-        self.start = cur;
+        self.vruntime
+            .fetch_add((now - start) * WEIGHT_0 / weight, Relaxed);
 
         debug_assert!(total_weight != 0);
         debug_assert!(period != 0);
-        debug_assert!(cur - self.period_start != 0);
+
+        debug_assert!(now - period_start != 0);
 
         // Check if the time slice is exhausted.
         //
         // The expression is dedicated to avoid overflowing.
-        let slice = period * self.weight / total_weight;
-        if cur - self.period_start > slice {
-            self.period_start = cur;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl Ord for FairAttr {
-    fn cmp(&self, other: &Self) -> cmp::Ordering {
-        (self.vruntime.cmp(&other.vruntime)).then_with(|| self.start.cmp(&other.start))
-    }
-}
-
-impl PartialOrd for FairAttr {
-    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Eq for FairAttr {}
-
-impl PartialEq for FairAttr {
-    fn eq(&self, other: &Self) -> bool {
-        self.vruntime == other.vruntime && self.start == other.start
+        let slice = period * weight / total_weight;
+        now - period_start > slice
     }
 }
 
@@ -146,11 +131,8 @@ impl core::fmt::Debug for FairQueueItem {
 }
 
 impl FairQueueItem {
-    fn key(&self) -> FairAttr {
-        match *self.0.sched_attr().lock() {
-            SchedAttr::Fair(vruntime) => vruntime,
-            _ => unreachable!(),
-        }
+    fn key(&self) -> u64 {
+        self.0.sched_attr().fair.vruntime.load(Relaxed)
     }
 }
 
@@ -164,7 +146,7 @@ impl Eq for FairQueueItem {}
 
 impl PartialOrd for FairQueueItem {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-        Some(self.key().cmp(&other.key()))
+        Some(self.cmp(other))
     }
 }
 
@@ -235,31 +217,14 @@ impl FairClassRq {
             front.next().unwrap();
         };
 
-        match &mut *thread.sched_attr().lock() {
-            SchedAttr::Fair(attr) => {
-                attr.start = sched_clock();
-                self.total_weight -= attr.weight;
-            }
-            _ => unreachable!(),
-        }
+        self.total_weight -= thread.sched_attr().fair.weight.load(Relaxed);
 
         Some(thread)
     }
 }
 
 impl SchedClassRq for FairClassRq {
-    type Attr = FairAttr;
-
-    fn enqueue(
-        &mut self,
-        thread: Arc<Thread>,
-        attr: SpinLockGuard<'_, SchedAttr, PreemptDisabled>,
-    ) {
-        match &*attr {
-            SchedAttr::Fair(vruntime) => self.total_weight += vruntime.weight,
-            _ => unreachable!(),
-        };
-        drop(attr);
+    fn enqueue(&mut self, thread: Arc<Thread>) {
         self.threads.insert(FairQueueItem(thread));
     }
 
@@ -271,16 +236,20 @@ impl SchedClassRq for FairClassRq {
         self.pop(None)
     }
 
-    fn update_current(&mut self, attr: &mut FairAttr, flags: UpdateFlags) -> bool {
+    fn update_current(&mut self, now: u64, thread: &Thread, flags: UpdateFlags) -> bool {
+        let attr = &thread.sched_attr().fair;
         match flags {
-            UpdateFlags::Yield => {
-                attr.period_start = sched_clock();
-                true
-            }
+            UpdateFlags::Yield => true,
             UpdateFlags::Tick | UpdateFlags::Wait => {
                 // Includes the current running thread.
-                let total_weight = self.total_weight + attr.weight;
-                attr.tick(total_weight, self.period())
+                let total_weight = self.total_weight + attr.weight.load(Relaxed);
+                attr.tick(
+                    now,
+                    thread.sched_attr().start.load(Relaxed),
+                    thread.sched_attr().period_start.load(Relaxed),
+                    total_weight,
+                    self.period(),
+                )
             }
         }
     }

@@ -135,7 +135,7 @@ impl SchedAttr {
         }
     }
 
-    /// Retrives the current scheduling policy of the thread.
+    /// Retrieves the current scheduling policy of the thread.
     pub fn policy(&self) -> SchedPolicy {
         *self.policy.lock()
     }

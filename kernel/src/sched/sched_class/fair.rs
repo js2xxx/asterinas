@@ -225,6 +225,7 @@ impl FairClassRq {
 
 impl SchedClassRq for FairClassRq {
     fn enqueue(&mut self, thread: Arc<Thread>) {
+        self.total_weight += thread.sched_attr().fair.weight.load(Relaxed);
         self.threads.insert(FairQueueItem(thread));
     }
 
